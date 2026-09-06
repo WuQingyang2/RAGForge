@@ -1,3 +1,4 @@
+from src.answer_normalization import normalize_answer
 import json
 from html import escape
 from pathlib import Path
@@ -133,31 +134,6 @@ st.markdown(
 )
 
 
-def normalize_answer(answer):
-    """兼容字典、JSON 字符串和 DashScope 的嵌套返回结构。"""
-    if isinstance(answer, str):
-        answer = json.loads(answer)
-    if not isinstance(answer, dict):
-        raise ValueError("返回内容不是有效的结构化答案")
-
-    content = answer.get("content", answer)
-    if isinstance(content, str):
-        content = json.loads(content)
-
-    if isinstance(content, dict):
-        nested = content.get("final_answer")
-        if isinstance(nested, str) and nested.lstrip().startswith("{"):
-            try:
-                parsed = json.loads(nested)
-                if isinstance(parsed, dict):
-                    content = parsed
-            except json.JSONDecodeError:
-                pass
-
-    if not isinstance(content, dict):
-        raise ValueError("无法解析模型返回的 content 字段")
-    return content
-
 
 def render_card(label, value, card_class):
     safe_value = escape(str(value if value not in (None, "") else "-"))
@@ -184,6 +160,8 @@ if submit_btn and user_question.strip():
                 content.get("reasoning_summary", "-"),
                 "summary-card",
             )
+            st.caption("来源引用（page_index 从 0 开始）")
+            st.json(content.get("references", []))
             relevant_pages = content.get("relevant_pages", [])
             st.markdown(
                 '<div class="result-label">相关页面：</div>',

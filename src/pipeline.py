@@ -12,6 +12,7 @@ from src.pdf_parsing import PDFParser
 from src import pdf_mineru
 from src.parsed_reports_merging import PageTextPreparation
 from src.text_splitter import TextSplitter
+from src.mineru_pages import load_mineru_pages, load_mineru_parts
 from src.ingestion import VectorDBIngestor
 from src.ingestion import BM25Ingestor
 from src.questions_processing import QuestionsProcessor
@@ -34,6 +35,8 @@ class PipelineConfig:
         
         self.vector_db_dir = self.databases_path / "vector_dbs"
         self.documents_dir = self.databases_path / "chunked_reports"
+        self.mineru_results_path = self.debug_data_path / "01_mineru_results"
+        self.page_reports_path = self.debug_data_path / "02_page_reports"
         self.bm25_db_path = self.databases_path / "bm25_dbs"
 
         # self.parsed_reports_dirname = "01_parsed_reports"
@@ -133,43 +136,61 @@ class Pipeline:
 
     def export_reports_to_markdown(self, file_name):
         """
-        使用 pdf_mineru.py，将指定 PDF 文件转换为 markdown，并放到 reports_markdown_dirname 目录下。
+        使用 MinerU 解析指定报告，保留完整 ZIP、结构化页内容和调试 Markdown。
         :param file_name: PDF 文件名（如 '【财报】中芯国际：中芯国际2024年年度报告.pdf'）
         """
         # 调用 pdf_mineru 获取 task_id 并下载、解压
         print(f"开始处理: {file_name}")
         task_id = pdf_mineru.get_task_id(file_name)
         print(f"task_id: {task_id}")
-        pdf_mineru.get_result(task_id)
+        extract_dir = pdf_mineru.get_result(task_id, self.paths.mineru_results_path)
+        if extract_dir is None:
+            raise RuntimeError(f"MinerU 未返回解析结果: {file_name}")
+        self.import_mineru_result(file_name, extract_dir)
 
-        # 解压后目录名与 task_id 相同
-        extract_dir = f"{task_id}"
-        md_path = os.path.join(extract_dir, "full.md")
-        if not os.path.exists(md_path):
-            print(f"未找到 markdown 文件: {md_path}")
-            return
-        # 目标目录
-        os.makedirs(self.paths.reports_markdown_path, exist_ok=True)
-        # 目标文件名为原始 file_name，扩展名改为 .md
-        base_name = os.path.splitext(file_name)[0]
-        target_path = os.path.join(self.paths.reports_markdown_path, f"{base_name}.md")
-        shutil.move(md_path, target_path)
-        print(f"已将 {md_path} 移动到 {target_path}")
+    def import_mineru_result(self, file_name: str, result_dir: Path, page_parts=None):
+        """从完整 MinerU 解压目录导入页级 JSON；可复用已下载结果。"""
+        if page_parts is None:
+            pages, source = load_mineru_pages(result_dir)
+        else:
+            pages, source = load_mineru_parts(result_dir, page_parts)
+        try:
+            metadata = pd.read_csv(self.paths.subset_path, encoding="utf-8", dtype=str)
+        except UnicodeDecodeError:
+            metadata = pd.read_csv(self.paths.subset_path, encoding="gbk", dtype=str)
+        key = "file_name" if "file_name" in metadata.columns else "sha1"
+        rows = metadata[metadata[key].map(lambda value: Path(str(value)).stem)
+                        == Path(file_name).stem]
+        if len(rows) != 1:
+            raise ValueError(f"subset.csv 中需要唯一的报告映射: {file_name}")
+        row = rows.iloc[0]
+        if any(pd.isna(row.get(k)) or not str(row[k]).strip()
+               for k in ("sha1", "company_name")):
+            raise ValueError(f"subset.csv 缺少 sha1 或 company_name: {file_name}")
+        report = {
+            "metainfo": {"sha1": row["sha1"], "company_name": row["company_name"],
+                         "file_name": Path(file_name).name,
+                         "source_content_list": source if isinstance(source, list) else str(source)},
+            "content": {"pages": pages},
+        }
+        self.paths.page_reports_path.mkdir(parents=True, exist_ok=True)
+        target = self.paths.page_reports_path / (Path(file_name).stem + ".json")
+        target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Markdown 仅用于人工查看，入库使用带页码 JSON。
+        markdown = list(Path(result_dir).rglob("full.md"))
+        if len(markdown) == 1:
+            self.paths.reports_markdown_path.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(markdown[0], self.paths.reports_markdown_path / (Path(file_name).stem + ".md"))
+        print(f"已保留 {len(pages)} 页结构化内容: {target}")
+        return target
 
     def chunk_reports(self, include_serialized_tables: bool = False):
-        """
-        将规整后 markdown 报告分块，便于后续向量化和检索
-        """
-        text_splitter = TextSplitter()
-        # 只处理 markdown 文件，输入目录为 reports_markdown_path，输出目录为 documents_dir
-        print(f"开始分割 {self.paths.reports_markdown_path} 目录下的 markdown 文件...")
-        # 自动传入 subset.csv 路径，便于补充 company_name 字段
-        text_splitter.split_markdown_reports(
-            all_md_dir=self.paths.reports_markdown_path,
-            output_dir=self.paths.documents_dir,
-            subset_csv=self.paths.subset_path
+        """按 PDF 页分块，300 token / 50 token 重叠，保留整页文本。"""
+        if not list(self.paths.page_reports_path.glob("*.json")):
+            raise ValueError("没有带页码的报告 JSON，请先重新解析 PDF 或调用 import_mineru_result；旧 full.md 无法恢复真实页码。")
+        TextSplitter().split_all_reports(
+            self.paths.page_reports_path, self.paths.documents_dir
         )
-        print(f"分割完成，结果已保存到 {self.paths.documents_dir}")
 
     def create_vector_dbs(self):
         """从分块报告创建向量数据库"""
@@ -335,24 +356,30 @@ if __name__ == "__main__":
     # 设置数据集根目录（此处以 test_set 为例）
     root_path = here() / "data" / "stock_data"
     print('root_path:', root_path)
-    #print(type(root_path))
+
     # 初始化主流程，使用推荐的最佳配置
     pipeline = Pipeline(root_path, run_config=max_config)
     
-    print('4. 将pdf转化为纯markdown文本')
-    #pipeline.export_reports_to_markdown('【财报】中芯国际：中芯国际2024年年度报告.pdf') 
+    print('1.解析PDF并保留带页码的结构化内容')
+    # pipeline.export_reports_to_markdown('【财报】中芯国际：中芯国际2024年年度报告.pdf')
+    pipeline.import_mineru_result(
+        "【财报】中芯国际：中芯国际2024年年度报告.pdf",
+        root_path / "debug_data" / "01_mineru_results",
+        # 已确认：原 PDF 前 200 页、后 22 页；偏移显式配置，不按文件名猜测。
+        page_parts=[
+            ("MinerU_【财报】中芯国际：中芯国际2024年年度报告__20260906153530.json", 0, 200),
+            ("MinerU_【财报】中芯国际：中芯国际2024年年度报告__20260906153537.json", 200, 22),
+        ],
+    )
 
-    # 5. 将规整后报告分块，便于后续向量化，输出到 databases/chunked_reports
-    print('5. 将规整后报告分块，便于后续向量化，输出到 databases/chunked_reports')
+    print('2.将规整后报告分块，便于后续向量化，输出到 databases/chunked_reports')
     pipeline.chunk_reports() 
     
-    # 6. 从分块报告创建向量数据库，输出到 databases/vector_dbs
-    print('6. 从分块报告创建向量数据库，输出到 databases/vector_dbs')
+    print('3.从分块报告创建向量数据库，输出到 databases/vector_dbs')
     pipeline.create_vector_dbs()     
     
-    # 7. 处理问题并生成答案，具体逻辑取决于 run_config
-    # 默认questions.json
-    print('7. 处理问题并生成答案，具体逻辑取决于 run_config')
+    # 默认使用 questions.json
+    print('4.处理问题并生成答案，具体逻辑取决于 run_config')
     pipeline.process_questions() 
     
     print('完成')

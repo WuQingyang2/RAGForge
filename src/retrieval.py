@@ -230,7 +230,11 @@ class VectorRetriever:
         seen_pages = set()
         for distance, index in zip(distances[0], indices[0]):
             distance = round(float(distance), 4)
+            if index < 0:
+                continue
             chunk = chunks[index]
+            if type(chunk.get("page")) is not int or chunk["page"] < 1:
+                raise ValueError("分块缺少有效页码，请重新解析、分块并重建向量库")
             parent_page = None
             if pages:
                 parent_page = next((page for page in pages if page["page"] == chunk.get("page")), None)
@@ -240,13 +244,15 @@ class VectorRetriever:
                     result = {
                         "distance": distance,
                         "page": parent_page["page"],
+                        "pdf_sha1": sha1,
                         "text": parent_page["text"]
                     }
                     retrieval_results.append(result)
             else:
                 result = {
                     "distance": distance,
-                    "page": chunk.get("page", 0),
+                    "page": chunk["page"],
+                    "pdf_sha1": sha1,
                     "text": chunk["text"]
                 }
                 retrieval_results.append(result)
@@ -276,6 +282,7 @@ class VectorRetriever:
             result = {
                 "distance": 0.5,
                 "page": page["page"],
+                "pdf_sha1": document["metainfo"]["sha1"],
                 "text": page["text"]
             }
             all_pages.append(result)

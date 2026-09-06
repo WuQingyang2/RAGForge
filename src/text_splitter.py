@@ -51,6 +51,7 @@ class TextSplitter():
             for chunk in page_chunks:
                 chunk['id'] = chunk_id
                 chunk['type'] = 'content'
+                chunk['pdf_sha1'] = file_content['metainfo']['sha1']
                 chunk_id += 1
                 chunks.append(chunk)
             

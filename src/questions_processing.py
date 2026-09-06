@@ -1,3 +1,4 @@
+from src.answer_normalization import normalize_answer
 import json
 from typing import Union, Dict, List, Optional
 import re
@@ -65,31 +66,25 @@ class QuestionsProcessor:
         for result in retrieval_results:
             page_number = result['page']
             text = result['text']
-            context_parts.append(f'Text retrieved from page {page_number}: \n"""\n{text}\n"""')
+            context_parts.append(f'Report SHA1: {result.get("pdf_sha1", "unknown")}; Text retrieved from page {page_number}: \n"""\n{text}\n"""')
             
         return "\n\n---\n\n".join(context_parts)
 
-    def _extract_references(self, pages_list: list, company_name: str) -> list:
-        # 根据公司名和页码列表，提取引用信息
-        if self.subset_path is None:
-            raise ValueError("subset_path is required for new challenge pipeline when processing references.")
-        # 优先尝试 utf-8，失败则尝试 gbk
-        try:
-            self.companies_df = pd.read_csv(self.subset_path, encoding='utf-8')
-        except UnicodeDecodeError:
-            print('警告：subset.csv 不是 utf-8 编码，自动尝试 gbk 编码...')
-            self.companies_df = pd.read_csv(self.subset_path, encoding='gbk')
-
-        # Find the company's SHA1 from the subset CSV
-        matching_rows = self.companies_df[self.companies_df['company_name'] == company_name]
-        if matching_rows.empty:
-            company_sha1 = ""
-        else:
-            company_sha1 = matching_rows.iloc[0]['sha1']
-
+    def _extract_references(self, pages_list: list, retrieval_results: list) -> list:
+        """引用来自实际检索文档；对外 page_index 统一从 0 开始。"""
         refs = []
-        for page in pages_list:
-            refs.append({"pdf_sha1": company_sha1, "page_index": page})
+        seen = set()
+        for result in retrieval_results:
+            page = result["page"]
+            if page not in pages_list:
+                continue
+            sha1 = result.get("pdf_sha1")
+            if not sha1 or type(page) is not int or page < 1:
+                raise ValueError("检索结果缺少报告 SHA1 或有效页码，请重建知识库")
+            key = (sha1, page - 1)
+            if key not in seen:
+                seen.add(key)
+                refs.append({"pdf_sha1": sha1, "page_index": page - 1})
         return refs
 
     def _validate_page_references(self, claimed_pages: list, retrieval_results: list, min_pages: int = 2, max_pages: int = 8) -> list:
@@ -166,6 +161,7 @@ class QuestionsProcessor:
             schema=schema,
             model=self.answering_model
         )
+        answer_dict = normalize_answer(answer_dict)
         t6 = time.time()
         print(f"[计时] [get_answer_for_company] LLM调用耗时: {t6-t5:.2f} 秒")
         self.response_data = self.openai_processor.response_data
@@ -173,7 +169,7 @@ class QuestionsProcessor:
             pages = answer_dict.get("relevant_pages", [])
             validated_pages = self._validate_page_references(pages, retrieval_results)
             answer_dict["relevant_pages"] = validated_pages
-            answer_dict["references"] = self._extract_references(validated_pages, company_name)
+            answer_dict["references"] = self._extract_references(validated_pages, retrieval_results)
         print(f"[计时] [get_answer_for_company] 总耗时: {t6-t0:.2f} 秒")
         return answer_dict
 
@@ -412,11 +408,11 @@ class QuestionsProcessor:
             if value == "N/A":
                 references = []
             else:
-                # Convert page indices from one-based to zero-based (competition requires 0-based page indices, but for debugging it is easier to use 1-based)
+                # references 已在生成时转换为从 0 开始，不再重复减一。
                 references = [
                     {
                         "pdf_sha1": ref["pdf_sha1"],
-                        "page_index": ref["page_index"] - 1
+                        "page_index": ref["page_index"]
                     }
                     for ref in references
                 ]
